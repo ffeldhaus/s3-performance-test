@@ -3,7 +3,7 @@
     <modelVersion>4.0.0</modelVersion>
 
     <groupId>com.netapp.s3</groupId>
-    <artifactId>performance-test</artifactId>
+    <artifactId>s3-performance-test</artifactId>
     <version>1.0</version>
     <packaging>jar</packaging>
 
@@ -17,9 +17,7 @@
         <dependency>
             <groupId>com.amazonaws</groupId>
             <artifactId>aws-java-sdk-s3</artifactId>
-            <version>1.11.225-SNAPSHOT</version>
-            <scope>system</scope>
-            <systemPath>/Users/ffeldhaus/development/aws-sdk-java/classes/artifacts/aws_java_sdk_s3_jar/aws-java-sdk-s3.jar</systemPath>
+            <version>1.11.224</version>
         </dependency>
         <dependency>
             <groupId>com.beust</groupId>
@@ -44,5 +42,15 @@
                 <directory>src/main/resources</directory>
             </resource>
         </resources>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <source>1.6</source>
+                    <target>1.6</target>
+                </configuration>
+            </plugin>
+        </plugins>
     </build>
 </project>
