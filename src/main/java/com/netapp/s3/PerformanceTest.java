@@ -55,7 +55,6 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.channels.Channels;
 import java.nio.channels.FileChannel;
-import java.nio.channels.FileLock;
 import java.nio.channels.ReadableByteChannel;
 import java.security.*;
 import java.security.cert.X509Certificate;
@@ -83,11 +82,11 @@ public class PerformanceTest {
 
     // setup logging
     final static private Logger logger = Logger.getLogger(PerformanceTest.class);
-
+    private final static int numberOfProcessors = Runtime.getRuntime().availableProcessors();
     /*
      * CLI Parameters
      */
-    @Parameter(names = {"--endpoint", "-e"})
+    @Parameter(names = {"--endpoint", "-e"}, description = "Custom S3 Endpoint (e.g. https://s3.example.org")
     private String endpoint = "";
     @Parameter(names = {"--size", "-s"}, description = "Size in MB")
     private int sizeInMb = 128;
@@ -101,7 +100,6 @@ public class PerformanceTest {
     private boolean help = false;
     @Parameter(names = {"--tempFileDirectory", "-t"}, description = "Path to directory were temp file should be stored")
     private String tempFileDirectory = null;
-
     // internal variables
     private long partSize;
     private String bucketName;
@@ -111,8 +109,6 @@ public class PerformanceTest {
     private TransferManager transferManager;
     private CloseableHttpClient client;
     private PoolingHttpClientConnectionManager connManager;
-
-    private final static int numberOfProcessors = Runtime.getRuntime().availableProcessors();
 
     public static void main(String[] args) throws IOException {
 
@@ -125,7 +121,7 @@ public class PerformanceTest {
         }
 
         try {
-        PerformanceTest.initialize();
+            PerformanceTest.initialize();
         } catch (NoSuchAlgorithmException e) {
             e.printStackTrace();
         } catch (KeyStoreException e) {
@@ -155,10 +151,10 @@ public class PerformanceTest {
     private static File createSampleFile(final long sizeInMb, final String tempFileDirectory) throws IOException {
         File file;
         if (StringUtils.isNullOrEmpty(tempFileDirectory)) {
-            file = File.createTempFile("s3-performance-test-", ".dat");
+            file = File.createTempFile("s3-performance-test-source-", ".dat");
         } else {
             File directory = new File(tempFileDirectory);
-            file = File.createTempFile("s3-performance-test-", ".dat", directory);
+            file = File.createTempFile("s3-performance-test-source-", ".dat", directory);
         }
 
         OutputStream outputStream = new FileOutputStream(file);
@@ -177,6 +173,26 @@ public class PerformanceTest {
         }
 
         return file;
+    }
+
+    private String getFileMd5(File file) throws IOException {
+        FileInputStream fileInputStream = new FileInputStream(file);
+
+        String md5sum = "";
+        MessageDigest messageDigest = null;
+        try {
+            messageDigest = MessageDigest.getInstance("MD5");
+            DigestInputStream digestInputStream = new DigestInputStream(fileInputStream, messageDigest);
+            digestInputStream.read();
+            byte[] buffer = new byte[8192];
+            while (digestInputStream.read(buffer) != -1) ;
+            digestInputStream.close();
+            md5sum = Hex.encodeHexString(messageDigest.digest());
+            fileInputStream.close();
+        } catch (NoSuchAlgorithmException e) {
+            e.printStackTrace();
+        }
+        return md5sum;
     }
 
     private void uploadObjectSinglePartWithAwsSdk(String bucketName, String key, File sourceFile, AmazonS3 s3Client) {
@@ -282,7 +298,7 @@ public class PerformanceTest {
         logger.info(String.format("Upload took %d seconds. Throughput was %.02f MB/s", elapsedSeconds, throughput));
     }
 
-    private void downloadObjectSinglePartWithAwsSdk(String bucketName, String key, File sourceFile, AmazonS3 s3Client) throws IOException {
+    private void downloadObjectSinglePartWithAwsSdk(String bucketName, String key, AmazonS3 s3Client) throws IOException {
 
         logger.info("Downloading object in one part using AWS SDK");
 
@@ -295,15 +311,15 @@ public class PerformanceTest {
         // create temporary File to save download to
         File destinationFile;
         if (StringUtils.isNullOrEmpty(tempFileDirectory)) {
-            destinationFile = File.createTempFile("s3-performance-test-", ".dat");
+            destinationFile = File.createTempFile("s3-performance-test-destination-", ".dat");
         } else {
             File directory = new File(tempFileDirectory);
-            destinationFile = File.createTempFile("s3-performance-test-", ".dat", directory);
+            destinationFile = File.createTempFile("s3-performance-test-destination-", ".dat", directory);
         }
         if (!keepFiles) {
             destinationFile.deleteOnExit();
         }
-        logger.info("Path to destination file: " + sourceFile.getAbsolutePath());
+        logger.info("Path to destination file: " + destinationFile.getAbsolutePath());
 
         OutputStream outputStream = new FileOutputStream(destinationFile);
 
@@ -329,7 +345,7 @@ public class PerformanceTest {
         logger.info(String.format("Download took %d seconds. Throughput was %.02f MB/s", elapsedSeconds, throughput));
     }
 
-    private void downloadObjectMultiPartWithAwsSdk(String bucketName, String key, File sourceFile, TransferManager transferManager) throws IOException {
+    private void downloadObjectMultiPartWithAwsSdk(String bucketName, String key, TransferManager transferManager) throws IOException {
         logger.info("Downloading object with AWS SDK High-Level API");
 
         // declare variables for performance measurement
@@ -341,13 +357,15 @@ public class PerformanceTest {
         // create temporary File to save download to
         File destinationFile;
         if (StringUtils.isNullOrEmpty(tempFileDirectory)) {
-            destinationFile = File.createTempFile("s3-performance-test-", ".dat");
+            destinationFile = File.createTempFile("s3-performance-test-destination-", ".dat");
         } else {
             File directory = new File(tempFileDirectory);
-            destinationFile = File.createTempFile("s3-performance-test-", ".dat", directory);
+            destinationFile = File.createTempFile("s3-performance-test-destination-", ".dat", directory);
         }
-        destinationFile.deleteOnExit();
-        logger.info("Path to destination file: " + sourceFile.getAbsolutePath());
+        if (!keepFiles) {
+            destinationFile.deleteOnExit();
+        }
+        logger.info("Path to destination file: " + destinationFile.getAbsolutePath());
 
         startTime = System.nanoTime();
         try
@@ -362,18 +380,8 @@ public class PerformanceTest {
             ie.printStackTrace();
         }
 
-        FileInputStream fileInputStream= new FileInputStream(destinationFile);
-
-        try {
-            MessageDigest messageDigest = MessageDigest.getInstance("MD5");
-            DigestInputStream digestInputStream = new DigestInputStream(fileInputStream, messageDigest);
-            fileInputStream.read();
-            String md5sum = Hex.encodeHexString(messageDigest.digest());
-            logger.info("MD5 sum of destination file: " + md5sum);
-            fileInputStream.close();
-        } catch (java.security.NoSuchAlgorithmException noSuchAlgorithmException) {
-            noSuchAlgorithmException.printStackTrace();
-        }
+        String md5sum = getFileMd5(destinationFile);
+        logger.info("MD5 sum of destination file: " + md5sum);
 
         elapsedTime = System.nanoTime() - startTime;
         elapsedSeconds = TimeUnit.SECONDS.convert(elapsedTime, TimeUnit.NANOSECONDS);
@@ -381,7 +389,7 @@ public class PerformanceTest {
         logger.info(String.format("Download took %d seconds. Throughput was %.02f MB/s", elapsedSeconds, throughput));
     }
 
-    private void downloadObjectMultiPartWithPresignedUrl(String bucketName, String key, File sourceFile, AmazonS3 s3Client) throws IOException {
+    private void downloadObjectMultiPartWithPresignedUrl(String bucketName, String key, AmazonS3 s3Client) throws IOException {
         logger.info("Downloading object multithreaded using pre-signed URLs");
 
         // declare variables for performance measurement
@@ -391,15 +399,23 @@ public class PerformanceTest {
         float throughput;
 
         // create temporary File to save download to
+        logger.info("Creating temporary file for download");
         File destinationFile;
         if (StringUtils.isNullOrEmpty(tempFileDirectory)) {
-            destinationFile = File.createTempFile("s3-performance-test-", ".dat");
+            destinationFile = File.createTempFile("s3-performance-test-destination-", ".dat");
         } else {
             File directory = new File(tempFileDirectory);
-            destinationFile = File.createTempFile("s3-performance-test-", ".dat", directory);
+            destinationFile = File.createTempFile("s3-performance-test-destination-", ".dat", directory);
         }
-        destinationFile.deleteOnExit();
-        logger.info("Path to destination file: " + sourceFile.getAbsolutePath());
+        if (!keepFiles) {
+            destinationFile.deleteOnExit();
+        }
+        // set file to given size by creating sparse file
+        RandomAccessFile randomAccessFile = new RandomAccessFile(destinationFile, "rw");
+        randomAccessFile.setLength(sizeInMb * MB);
+        randomAccessFile.close();
+
+        logger.info("Path to destination file: " + destinationFile.getAbsolutePath());
 
         int numberOfDownloadThreads = (int) ((float) (sizeInMb * MB) / partSize);
         logger.info("Number of download threads:" + numberOfDownloadThreads);
@@ -409,25 +425,20 @@ public class PerformanceTest {
         URL url = s3Client.generatePresignedUrl(pur);
         long startByte;
         long endByte;
-        for (
-                int i = 0;
-                i < numberOfDownloadThreads; i++)
-
-        {
+        for (int i = 0; i < numberOfDownloadThreads; i++) {
             HttpGet get = new HttpGet(url.toString());
             startByte = i * partSize;
             if (i == numberOfDownloadThreads - 1) {
-                endByte = sizeInMb * MB;
+                endByte = sizeInMb * MB + 1;
             } else {
                 endByte = (i + 1) * partSize - 1;
             }
             get.setHeader("Range", "bytes=" + startByte + "-" + endByte);
-            threads[i] = new MultiHttpClientConnThread(client, get, startByte, sourceFile);
+            threads[i] = new MultiHttpClientConnThread(client, get, startByte, destinationFile);
         }
 
         startTime = System.nanoTime();
-        for (
-                MultiHttpClientConnThread thread : threads)
+        for (MultiHttpClientConnThread thread : threads)
 
         {
             thread.start();
@@ -443,6 +454,9 @@ public class PerformanceTest {
             }
         }
 
+        String md5sum = getFileMd5(destinationFile);
+        logger.info("MD5 sum of destination file: " + md5sum);
+
         elapsedTime = System.nanoTime() - startTime;
         elapsedSeconds = TimeUnit.SECONDS.convert(elapsedTime, TimeUnit.NANOSECONDS);
         throughput = (float) sizeInMb / elapsedSeconds;
@@ -457,7 +471,6 @@ public class PerformanceTest {
     private void initialize() throws IOException, KeyStoreException, NoSuchAlgorithmException, KeyManagementException {
         if (debug) {
             logger.getLogger("com.amazonaws.request").setLevel(Level.DEBUG);
-            logger.getLogger("com.netapp.s3.performancetest").setLevel(Level.DEBUG);
             logger.getLogger("com.netapp.s3.performancetest").setLevel(Level.DEBUG);
             logger.getLogger("org.apache.http").setLevel(Level.DEBUG);
             logger.getLogger("org.apache.http.wire").setLevel(Level.ERROR);
@@ -598,12 +611,12 @@ public class PerformanceTest {
         //uploadStreamMultiPartWithPresignedUrls(bucketName, key, new RandomStream(partSize / MB, 0), s3Client);
 
         logger.info("### Starting Object Download Tests ###");
-        downloadObjectSinglePartWithAwsSdk(bucketName, key, sourceFile, s3Client);
-        downloadObjectMultiPartWithAwsSdk(bucketName, key, sourceFile, transferManager);
+        downloadObjectSinglePartWithAwsSdk(bucketName, key, s3Client);
+        downloadObjectMultiPartWithAwsSdk(bucketName, key, transferManager);
 
-        // logger.info("### Starting Streaming Download Tests ###")
+        logger.info("### Starting Streaming Download Tests ###");
         //TODO: Create/Improve Streaming Download Tests using PresignedUrls
-        downloadObjectMultiPartWithPresignedUrl(bucketName,key,sourceFile,s3Client);
+        downloadObjectMultiPartWithPresignedUrl(bucketName, key, s3Client);
     }
 
     private void cleanup() {
@@ -686,35 +699,40 @@ public class PerformanceTest {
             try {
                 logger.debug("Thread Running: " + getName());
 
-                final int size = 4 * KB;
-                long offset = this.startByte;
+                CloseableHttpResponse response = client.execute(get);
 
-                final CloseableHttpResponse response = client.execute(get);
+                Long length = response.getEntity().getContentLength();
 
-                MessageDigest messageDigest = MessageDigest.getInstance("MD5");
+                //MessageDigest messageDigest = MessageDigest.getInstance("MD5");
                 InputStream inputStream = response.getEntity().getContent();
-                DigestInputStream digestInputStream = new DigestInputStream(inputStream, messageDigest);
-                ReadableByteChannel sourceChannel = Channels.newChannel(digestInputStream);
+                //DigestInputStream digestInputStream = new DigestInputStream(inputStream, messageDigest);
+                //ReadableByteChannel readableByteChannel = Channels.newChannel(digestInputStream);
+                ReadableByteChannel readableByteChannel = Channels.newChannel(inputStream);
+                //RandomAccessFile randomAccessFile = new RandomAccessFile(destinationFile, "rw");
+                //FileChannel fileChannel = randomAccessFile.getChannel();
+
                 RandomAccessFile randomAccessFile = new RandomAccessFile(destinationFile, "rw");
-                FileChannel destinationChannel = randomAccessFile.getChannel();
-                FileLock lock = destinationChannel.tryLock(offset, size, true);
+                FileChannel fileChannel = randomAccessFile.getChannel();
+                //FileLock lock = destinationChannel.tryLock(offset, size, false);
 
-                destinationChannel.transferFrom(sourceChannel, 0, Long.MAX_VALUE);
+                fileChannel.transferFrom(readableByteChannel, startByte, length);
 
-                digestInputStream.close();
-                lock.release();
-                String md5sum = Hex.encodeHexString(messageDigest.digest());
-                logger.info("MD5 sum: " + md5sum);
-
-                response.close();
+                //digestInputStream.close();
+                //lock.release();
+                //String md5sum = Hex.encodeHexString(messageDigest.digest());
+                //logger.info("MD5 sum: " + md5sum);
 
                 logger.debug("Thread Finished: " + getName());
+
+                response.close();
+                fileChannel.close();
+                randomAccessFile.close();
             } catch (final ClientProtocolException ex) {
                 logger.error("", ex);
             } catch (final IOException ex) {
                 logger.error("", ex);
-            } catch (final java.security.NoSuchAlgorithmException ex) {
-                logger.error("", ex);
+                //} catch (final java.security.NoSuchAlgorithmException ex) {
+                //    logger.error("", ex);
             }
         }
 
