@@ -22,6 +22,7 @@ import com.amazonaws.client.builder.AwsClientBuilder.EndpointConfiguration;
 import com.amazonaws.client.builder.ExecutorFactory;
 import com.amazonaws.services.s3.AmazonS3;
 import com.amazonaws.services.s3.AmazonS3ClientBuilder;
+import com.amazonaws.services.s3.internal.ServiceUtils;
 import com.amazonaws.services.s3.model.*;
 import com.amazonaws.services.s3.transfer.Download;
 import com.amazonaws.services.s3.transfer.TransferManager;
@@ -32,7 +33,6 @@ import com.amazonaws.util.StringUtils;
 import com.beust.jcommander.JCommander;
 import com.beust.jcommander.Parameter;
 import org.apache.commons.codec.binary.Hex;
-import org.apache.commons.lang3.RandomUtils;
 import org.apache.http.client.ClientProtocolException;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
@@ -65,8 +65,8 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 
 /**
- * This sample demonstrates how to make basic requests to S3 using
- * the AWS SDK for Java.
+ * This class demonstrates different methods to make basic requests to
+ * an S3 endpoint
  * <p>
  * <b>Prerequisites:</b> You must have a valid S3 account.
  * <p>
@@ -77,8 +77,8 @@ import java.util.concurrent.TimeUnit;
 public class PerformanceTest {
 
     // define some values for megabyte and kilobyte
-    private static final int KB = 1024;
-    private static final int MB = 1024 * KB;
+    private static final long KB = 1024;
+    private static final long MB = 1024 * KB;
 
     // setup logging
     final static private Logger logger = Logger.getLogger(PerformanceTest.class);
@@ -134,6 +134,8 @@ public class PerformanceTest {
             PerformanceTest.run();
         } catch (java.io.IOException ioe) {
             ioe.printStackTrace();
+        } catch (NoSuchAlgorithmException e) {
+            e.printStackTrace();
         }
 
         PerformanceTest.cleanup();
@@ -158,7 +160,7 @@ public class PerformanceTest {
         }
 
         OutputStream outputStream = new FileOutputStream(file);
-        InputStream inputStream = new RandomStream(sizeInMb * MB, 0);
+        InputStream inputStream = new RandomInputStream(sizeInMb * MB);
 
         try {
             MessageDigest messageDigest = MessageDigest.getInstance("MD5");
@@ -173,6 +175,31 @@ public class PerformanceTest {
         }
 
         return file;
+    }
+
+    public static byte[] hexStringToByteArray(String input) {
+        int len = input.length();
+
+        if (len == 0) {
+            return new byte[] {};
+        }
+
+        byte[] data;
+        int startIdx;
+        if (len % 2 != 0) {
+            data = new byte[(len / 2) + 1];
+            data[0] = (byte) Character.digit(input.charAt(0), 16);
+            startIdx = 1;
+        } else {
+            data = new byte[len / 2];
+            startIdx = 0;
+        }
+
+        for (int i = startIdx; i < len; i += 2) {
+            data[(i + 1) / 2] = (byte) ((Character.digit(input.charAt(i), 16) << 4)
+                    + Character.digit(input.charAt(i+1), 16));
+        }
+        return data;
     }
 
     private String getFileMd5(File file) throws IOException {
@@ -273,7 +300,7 @@ public class PerformanceTest {
             try {
                 connection = (HttpURLConnection) url.openConnection();
                 connection.setRequestMethod("POST");
-                connection.setRequestProperty("Content-Length", Integer.toString(sizeInMb * MB));
+                connection.setRequestProperty("Content-Length", Long.toString(sizeInMb * MB));
                 connection.setDoOutput(true);
                 DataOutputStream wr = new DataOutputStream(connection.getOutputStream());
                 byte[] buffer = new byte[4 * 1024]; // Adjust if you want
@@ -343,6 +370,7 @@ public class PerformanceTest {
         elapsedSeconds = TimeUnit.SECONDS.convert(elapsedTime, TimeUnit.NANOSECONDS);
         throughput = (float) sizeInMb / elapsedSeconds;
         logger.info(String.format("Download took %d seconds. Throughput was %.02f MB/s", elapsedSeconds, throughput));
+        destinationFile.delete();
     }
 
     private void downloadObjectMultiPartWithAwsSdk(String bucketName, String key, TransferManager transferManager) throws IOException {
@@ -387,9 +415,10 @@ public class PerformanceTest {
         elapsedSeconds = TimeUnit.SECONDS.convert(elapsedTime, TimeUnit.NANOSECONDS);
         throughput = (float) sizeInMb / elapsedSeconds;
         logger.info(String.format("Download took %d seconds. Throughput was %.02f MB/s", elapsedSeconds, throughput));
+        destinationFile.delete();
     }
 
-    private void downloadObjectMultiPartWithPresignedUrl(String bucketName, String key, AmazonS3 s3Client) throws IOException {
+    private void downloadObjectMultiPartWithPresignedUrl(String bucketName, String key, AmazonS3 s3Client) throws IOException, NoSuchAlgorithmException {
         logger.info("Downloading object multithreaded using pre-signed URLs");
 
         // declare variables for performance measurement
@@ -417,52 +446,102 @@ public class PerformanceTest {
 
         logger.info("Path to destination file: " + destinationFile.getAbsolutePath());
 
-        int numberOfDownloadThreads = (int) ((float) (sizeInMb * MB) / partSize);
-        logger.info("Number of download threads:" + numberOfDownloadThreads);
-        MultiHttpClientConnThread[] threads
-                = new MultiHttpClientConnThread[numberOfDownloadThreads];
-        GeneratePresignedUrlRequest pur = new GeneratePresignedUrlRequest(bucketName, key, HttpMethod.GET);
-        URL url = s3Client.generatePresignedUrl(pur);
-        long startByte;
-        long endByte;
-        for (int i = 0; i < numberOfDownloadThreads; i++) {
-            HttpGet get = new HttpGet(url.toString());
-            startByte = i * partSize;
-            if (i == numberOfDownloadThreads - 1) {
-                endByte = sizeInMb * MB + 1;
-            } else {
-                endByte = (i + 1) * partSize - 1;
+        String[] md5sums;
+
+        // check if multipart download is supported
+        logger.info("Checking if multipart downloads are supported by S3 endpoint");
+        GetObjectRequest getObjectRequest = new GetObjectRequest(bucketName, key);
+        Integer partCount = ServiceUtils.getPartCount(getObjectRequest,s3Client);
+        if (partCount != null) {
+            logger.info("Part count: " + partCount);
+            md5sums = new String[partCount];
+            MultiHttpClientConnThread[] threads = new MultiHttpClientConnThread[partCount];
+            GeneratePresignedUrlRequest pur = new GeneratePresignedUrlRequest(bucketName, key, HttpMethod.GET);
+            pur.addRequestParameter("partNumber","1");
+            URL url = s3Client.generatePresignedUrl(pur);
+
+            for (int i = 0; i < partCount; i++) {
+                HttpGet get = new HttpGet(url.toString());
+                threads[i] = new MultiHttpClientConnThread(client, get, destinationFile, true, logger);
+                threads[i].number = i;
             }
-            get.setHeader("Range", "bytes=" + startByte + "-" + endByte);
-            threads[i] = new MultiHttpClientConnThread(client, get, startByte, destinationFile);
+
+            startTime = System.nanoTime();
+            for (MultiHttpClientConnThread thread : threads) {
+                thread.start();
+            }
+            for (MultiHttpClientConnThread thread : threads) {
+                try {
+                    thread.join();
+                    md5sums[thread.number] = thread.md5sum;
+                } catch (java.lang.InterruptedException ie) {
+                    ie.printStackTrace();
+                }
+            }
+
+            elapsedTime = System.nanoTime() - startTime;
+            elapsedSeconds = TimeUnit.SECONDS.convert(elapsedTime, TimeUnit.NANOSECONDS);
+            throughput = (float) sizeInMb / elapsedSeconds;
+            logger.info(String.format("Download took %d seconds. Throughput was %.02f MB/s", elapsedSeconds, throughput));
+            destinationFile.delete();
         }
+        else {
+            logger.info("Multipart downloads not supported, using range reads");
 
-        startTime = System.nanoTime();
-        for (MultiHttpClientConnThread thread : threads)
+            partCount = (int) ((float) (sizeInMb * MB) / partSize);
+            md5sums = new String[partCount];
 
-        {
-            thread.start();
-        }
-        for (
-                MultiHttpClientConnThread thread : threads)
+            logger.info("Number of download threads:" + partCount);
+            MultiHttpClientConnThread[] threads = new MultiHttpClientConnThread[partCount];
+            GeneratePresignedUrlRequest pur = new GeneratePresignedUrlRequest(bucketName, key, HttpMethod.GET);
+            URL url = s3Client.generatePresignedUrl(pur);
+            long startByte;
+            long endByte;
+            for (int i = 0; i < partCount; i++) {
+                HttpGet get = new HttpGet(url.toString());
+                startByte = i * partSize;
+                if (i == partCount - 1) {
+                    endByte = sizeInMb * MB + 1;
+                } else {
+                    endByte = (i + 1) * partSize - 1;
+                }
+                get.setHeader("Range", "bytes=" + startByte + "-" + endByte);
+                threads[i] = new MultiHttpClientConnThread(client, get, destinationFile, true, logger);
+                threads[i].number = i;
+            }
 
-        {
-            try {
-                thread.join();
-            } catch (java.lang.InterruptedException ie) {
-                ie.printStackTrace();
+            startTime = System.nanoTime();
+            for (MultiHttpClientConnThread thread : threads) {
+                thread.start();
+            }
+            for (MultiHttpClientConnThread thread : threads) {
+                try {
+                    thread.join();
+                    md5sums[thread.number] = thread.md5sum;
+                } catch (java.lang.InterruptedException ie) {
+                    ie.printStackTrace();
+                }
             }
         }
 
-        String md5sum = getFileMd5(destinationFile);
-        logger.info("MD5 sum of destination file: " + md5sum);
+        String joinedMd5 = StringUtils.join("",md5sums);
+        byte[] byteArray = hexStringToByteArray(joinedMd5);
+        MessageDigest md5Digest = MessageDigest.getInstance("MD5");
+        md5Digest.update(byteArray);
+        String etag = Hex.encodeHexString(md5Digest.digest()) + "-" + partCount;
+        logger.info("ETag sum as calculated from MD5 sum of parts: " + etag);
+
+        ObjectMetadata objectMetadata = s3Client.getObjectMetadata(new GetObjectMetadataRequest(bucketName,key));
+        logger.info("Etag from object: " + objectMetadata.getETag());
 
         elapsedTime = System.nanoTime() - startTime;
         elapsedSeconds = TimeUnit.SECONDS.convert(elapsedTime, TimeUnit.NANOSECONDS);
         throughput = (float) sizeInMb / elapsedSeconds;
+
+        String md5sum = getFileMd5(destinationFile);
+        logger.info("MD5 sum of destination file: " + md5sum);
+
         logger.info(String.format("Download took %d seconds. Throughput was %.02f MB/s", elapsedSeconds, throughput));
-        client.close();
-        connManager.close();
     }
 
     /**
@@ -471,7 +550,7 @@ public class PerformanceTest {
     private void initialize() throws IOException, KeyStoreException, NoSuchAlgorithmException, KeyManagementException {
         if (debug) {
             logger.getLogger("com.amazonaws.request").setLevel(Level.DEBUG);
-            logger.getLogger("com.netapp.s3.performancetest").setLevel(Level.DEBUG);
+            logger.getLogger("com.netapp.s3.PerformanceTest").setLevel(Level.DEBUG);
             logger.getLogger("org.apache.http").setLevel(Level.DEBUG);
             logger.getLogger("org.apache.http.wire").setLevel(Level.ERROR);
         }
@@ -487,7 +566,7 @@ public class PerformanceTest {
         }
 
         // calculate minimum multipart upload size and limit it to max. 512MB
-        partSize = sizeInMb / numberOfProcessors;
+        partSize = sizeInMb / (long)numberOfProcessors;
 
         if (partSize > 512) {
             partSize = 512 * MB;
@@ -601,10 +680,12 @@ public class PerformanceTest {
         s3Client.createBucket(bucketName);
     }
 
-    private void run() throws IOException {
+    private void run() throws IOException, NoSuchAlgorithmException {
         logger.info("### Starting Object Upload Tests ###");
-        uploadObjectSinglePartWithAwsSdk(bucketName, key, sourceFile, s3Client);
+        //uploadObjectSinglePartWithAwsSdk(bucketName, key, sourceFile, s3Client);
         uploadObjectMultiPartWithAwsSdk(bucketName, key, sourceFile, transferManager);
+
+        sourceFile.delete();
 
         // logger.info("### Starting Streaming Upload Tests ###")
         // TODO: Create/Improve Streaming Upload Tests using Chunk uploads and PresignedUrls
@@ -619,7 +700,7 @@ public class PerformanceTest {
         downloadObjectMultiPartWithPresignedUrl(bucketName, key, s3Client);
     }
 
-    private void cleanup() {
+    private void cleanup() throws IOException {
         logger.info("Deleting object " + key);
         s3Client.deleteObject(bucketName, key);
 
@@ -628,70 +709,29 @@ public class PerformanceTest {
 
         // shutdown Transfer Manager to release threads
         transferManager.shutdownNow();
-    }
 
-    /**
-     * Creates a temporary inputStream of size sizeInMb with random data generated by a fast random number generator
-     *
-     * @return A newly created InputStream with size sizeInMb.
-     */
-
-    private static class RandomStream extends InputStream {
-
-        private long pos, size;
-        private int seed;
-
-        RandomStream(long size) {
-            this(size, RandomUtils.nextInt());
-        }
-
-        RandomStream(long size, int seed) {
-            this.size = size;
-            this.seed = seed;
-        }
-
-        @Override
-        public int read() {
-            byte[] data = new byte[1];
-            int len = read(data, 0, 1);
-            return len <= 0 ? len : data[0] & 255;
-        }
-
-        @Override
-        public int read(byte[] b, int off, int len) {
-            if (pos >= size) {
-                return -1;
-            }
-            len = (int) Math.min(size - pos, len);
-            int x = seed, end = off + len;
-            // a fast and very simple pseudo-random number generator
-            // with a period length of 4 GB
-            // also good: x * 9 + 1, shift 6; x * 11 + 1, shift 7
-            while (off < end) {
-                x = (x << 4) + x + 1;
-                b[off++] = (byte) (x >> 8);
-            }
-            seed = x;
-            pos += len;
-            return len;
-        }
-
+        // shutting down HTTP client and HTTP connection manager
+        client.close();
+        connManager.close();
     }
 
     private class MultiHttpClientConnThread extends Thread {
-        private final Logger logger = Logger.getLogger(getClass());
+        private final Logger logger;
 
         private final CloseableHttpClient client;
         private final HttpGet get;
+        private final Boolean calculateMd5;
+        public String md5sum;
+        public int number;
 
         private File destinationFile;
-        private long startByte = 0;
 
-        public MultiHttpClientConnThread(final CloseableHttpClient client, final HttpGet get, final long startByte, final File destinationFile) {
+        public MultiHttpClientConnThread(final CloseableHttpClient client, final HttpGet get, final File destinationFile, final Boolean calculateMd5, Logger logger) {
+            this.logger = logger;
             this.client = client;
             this.get = get;
             this.destinationFile = destinationFile;
-            this.startByte = startByte;
+            this.calculateMd5 = calculateMd5;
         }
 
         @Override
@@ -701,29 +741,45 @@ public class PerformanceTest {
 
                 CloseableHttpResponse response = client.execute(get);
 
+                String contentRange = response.getFirstHeader("Content-Range").getValue();
+                Long startByte = Long.parseLong(contentRange.split("[ -/]")[1]);
+                logger.debug("Start Byte " + startByte);
+
                 Long length = response.getEntity().getContentLength();
 
-                //MessageDigest messageDigest = MessageDigest.getInstance("MD5");
+                // workaround if Content-Length header is not available
+                if (length == -1) {
+                    logger.debug("Content-Length header not available, extracting length from Content-Range header");
+                    length = Long.parseLong(contentRange.split("[ -/]")[2]) - Long.parseLong(contentRange.split("[ -/]")[1]) + 1    ;
+                }
+                logger.debug("Length: " + length);
+
                 InputStream inputStream = response.getEntity().getContent();
-                //DigestInputStream digestInputStream = new DigestInputStream(inputStream, messageDigest);
-                //ReadableByteChannel readableByteChannel = Channels.newChannel(digestInputStream);
-                ReadableByteChannel readableByteChannel = Channels.newChannel(inputStream);
-                //RandomAccessFile randomAccessFile = new RandomAccessFile(destinationFile, "rw");
-                //FileChannel fileChannel = randomAccessFile.getChannel();
+
+                ReadableByteChannel readableByteChannel;
+
+                MessageDigest messageDigest = MessageDigest.getInstance("MD5");
+                DigestInputStream digestInputStream = new DigestInputStream(inputStream, messageDigest);
+                if (calculateMd5) {
+                    logger.debug("Calculating MD5 sum enabled");
+                    readableByteChannel = Channels.newChannel(digestInputStream);
+                } else {
+                    readableByteChannel = Channels.newChannel(inputStream);
+                }
 
                 RandomAccessFile randomAccessFile = new RandomAccessFile(destinationFile, "rw");
                 FileChannel fileChannel = randomAccessFile.getChannel();
-                //FileLock lock = destinationChannel.tryLock(offset, size, false);
 
                 fileChannel.transferFrom(readableByteChannel, startByte, length);
 
-                //digestInputStream.close();
-                //lock.release();
-                //String md5sum = Hex.encodeHexString(messageDigest.digest());
-                //logger.info("MD5 sum: " + md5sum);
+                if (calculateMd5) {
+                    md5sum = Hex.encodeHexString(messageDigest.digest());
+                    logger.debug("Part MD5 sum: " + md5sum);
+                }
 
                 logger.debug("Thread Finished: " + getName());
 
+                digestInputStream.close();
                 response.close();
                 fileChannel.close();
                 randomAccessFile.close();
@@ -731,8 +787,8 @@ public class PerformanceTest {
                 logger.error("", ex);
             } catch (final IOException ex) {
                 logger.error("", ex);
-                //} catch (final java.security.NoSuchAlgorithmException ex) {
-                //    logger.error("", ex);
+            } catch (NoSuchAlgorithmException e) {
+                e.printStackTrace();
             }
         }
 
