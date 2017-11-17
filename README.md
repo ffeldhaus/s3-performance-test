@@ -13,7 +13,13 @@ Show the help with
 java -jar performance-test.jar --help
 ```
 
-Run with the following command
+To run with the defaults (e.g. against AWS S3) just use
 ```
-java -jar performance-test.jar --help
+java -jar performance-test.jar
+```
+
+To run with custom endpoint and specific object size, specify optional parameters and change 
+`<protocol>://<endpoint>[:<port>]` (e.g. `https://s3.example.com:8082`) and `<size in MB>` (e.g. 1024`) as required:
+```
+java -jar performance-test.jar --endpoint <protocol>://<endpoint>[:<port>] --size <size in MB>
 ```
